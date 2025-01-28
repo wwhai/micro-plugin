@@ -16,34 +16,52 @@
 #ifndef PLUGIN_MANAGER_H
 #define PLUGIN_MANAGER_H
 
-#include <stdbool.h>
+#include <lua.h>
+#include <pthread.h>
+// 定义插件状态枚举
+typedef enum
+{
+    PLUGIN_UNLOADED,
+    PLUGIN_LOADED,
+    PLUGIN_RUNNING
+} PluginState;
 
+// 定义插件结构体
+typedef struct Plugin
+{
+    char *name;
+    char *version;
+    char *author;
+    char *description;
+    lua_State *L;
+    int resource_ref;
+    PluginState state;
+    struct Plugin *next;
+} Plugin;
+
+// 定义插件管理器结构体
 typedef struct
 {
-    char name[100];
-    char version[20];
-    char author[100];
-    char description[200];
-    char signature[100];
-    int state; // 0: Stopped, 1: Running
-} PluginDetail;
+    Plugin *plugins;
+    pthread_mutex_t lock;
+} PluginManager;
 
 // 初始化插件管理器
-void plugin_manager_init();
+void plugin_manager_init(PluginManager *manager);
+
+// 释放插件管理器
+void plugin_manager_destroy(PluginManager *manager);
 
 // 加载插件
-bool plugin_manager_load(const char *zip_path);
+Plugin *plugin_manager_load(PluginManager *manager, const char *zip_filename);
 
 // 卸载插件
-bool plugin_manager_unload(const char *plugin_name);
+int plugin_manager_unload(PluginManager *manager, const char *name);
 
-// 查看所有已加载的插件
-void plugin_manager_list();
+// 执行插件的主逻辑
+int plugin_manager_execute(PluginManager *manager, const char *name);
 
-// 查看插件状态
-PluginDetail plugin_manager_get_state(const char *plugin_name);
+// 查询插件状态
+PluginState plugin_manager_query_state(PluginManager *manager, const char *name);
 
-// 清理插件管理器
-void plugin_manager_cleanup();
-
-#endif
+#endif // PLUGIN_MANAGER_H

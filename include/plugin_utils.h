@@ -13,23 +13,21 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// plugin_utils.h
+#ifndef UTILS_H
+#define UTILS_H
 
-// 防止头文件被重复包含
-#ifndef PLUGIN_UTILS_H
-#define PLUGIN_UTILS_H
+#include <openssl/md5.h>
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <zip.h>
-#include "plugin_manager.h"
-#include <lua.h>
-// 读取 app.properties 文件内容
-bool read_app_properties(zip_t *z, PluginDetail *detail);
-// 读取 app.properties 文件中的 [env] 部分并传递给 Lua
-void read_env_params(zip_t *z, lua_State *L);
-// 验证插件签名
-bool verify_signature(const char *expected_signature);
+// 从 ZIP 文件中读取文件内容
+char *read_file_from_zip(const char *zip_filename, const char *file_to_read);
 
-#endif // PLUGIN_UTILS_H
+// 从 ZIP 文件中提取文件
+void extract_file_from_zip(const char *zip_filename, const char *file_in_zip, const char *output_filename);
+
+// 计算文件的 MD5 校验码
+char *calculate_md5(const char *filename);
+
+// 解析 INI 文件内容到 Lua 表
+void parse_ini_to_lua_table(lua_State *L, const char *ini_content);
+
+#endif // UTILS_H
