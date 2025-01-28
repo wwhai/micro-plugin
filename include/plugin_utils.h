@@ -16,8 +16,6 @@
 #ifndef UTILS_H
 #define UTILS_H
 
-#include <openssl/md5.h>
-
 // 从 ZIP 文件中读取文件内容
 char *read_file_from_zip(const char *zip_filename, const char *file_to_read);
 

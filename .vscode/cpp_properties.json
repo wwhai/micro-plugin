@@ -4,8 +4,9 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/include",
-                "/usr/local/include"
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/src",
+                "E:\\workspace\\linux-include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
