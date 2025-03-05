@@ -1,0 +1,12 @@
+{
+    "files.associations": {
+        "*.h": "cpp",
+        "*.c": "cpp",
+        "*.hpp": "cpp",
+        "*.cpp": "cpp",
+        "typeinfo": "cpp"
+    },
+    "Lua.diagnostics.disable": [
+        "lowercase-global"
+    ]
+}

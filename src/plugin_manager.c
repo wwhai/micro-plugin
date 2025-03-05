@@ -1,282 +1,269 @@
-// Copyright (C) 2025 wwhai
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-
+#include "plugin_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
 #include <pthread.h>
-#include <zlib.h>
-#include "plugin_manager.h"
-#include "plugin_utils.h"
+#include <ini.h>
 
-// 初始化插件管理器
-void plugin_manager_init(PluginManager *manager)
+// 互斥锁，用于多线程安全
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 存储解析后的 ENV 数据
+typedef struct
 {
-    manager->plugins = NULL;
-    pthread_mutex_init(&manager->lock, NULL);
+    lua_State *L;
+    int env_table_index;
+} EnvData;
+
+// 自定义的 INI 解析回调函数
+static int my_ini_handler(void *user, const char *section, const char *name, const char *value)
+{
+    EnvData *env_data = (EnvData *)user;
+    lua_State *L = env_data->L;
+    int env_table_index = env_data->env_table_index;
+
+    lua_pushstring(L, name);
+    lua_pushstring(L, value);
+    lua_settable(L, env_table_index);
+
+    return 1;
 }
 
-// 释放插件管理器
-void plugin_manager_destroy(PluginManager *manager)
+// 初始化插件管理器
+PluginManager *plugin_manager_init()
 {
-    pthread_mutex_lock(&manager->lock);
-    Plugin *current = manager->plugins;
-    while (current != NULL)
+    PluginManager *manager = (PluginManager *)malloc(sizeof(PluginManager));
+    if (manager == NULL)
     {
-        Plugin *next = current->next;
-        free(current->name);
-        free(current->version);
-        free(current->author);
-        free(current->description);
-        lua_close(current->L);
-        free(current);
-        current = next;
+        return NULL;
     }
-    pthread_mutex_unlock(&manager->lock);
-    pthread_mutex_destroy(&manager->lock);
+    manager->plugins = NULL;
+    manager->plugin_count = 0;
+    return manager;
+}
+
+// 从 ZIP 包中提取文件
+static int extract_file_from_zip(const char *zip_path, const char *filename, char **content)
+{
+    struct zip *za;
+    struct zip_stat sb;
+    int err;
+
+    za = zip_open(zip_path, 0, &err);
+    if (za == NULL)
+    {
+        return -1;
+    }
+
+    if (zip_stat(za, filename, 0, &sb) == -1)
+    {
+        zip_close(za);
+        return -1;
+    }
+
+    *content = (char *)malloc(sb.size + 1);
+    if (*content == NULL)
+    {
+        zip_close(za);
+        return -1;
+    }
+
+    struct zip_file *zf = zip_fopen(za, filename, 0);
+    if (zf == NULL)
+    {
+        free(*content);
+        zip_close(za);
+        return -1;
+    }
+
+    zip_fread(zf, *content, sb.size);
+    (*content)[sb.size] = '\0';
+
+    zip_fclose(zf);
+    zip_close(za);
+
+    return 0;
 }
 
 // 加载插件
-Plugin *plugin_manager_load(PluginManager *manager, const char *zip_filename)
+int plugin_load(PluginManager *manager, const char *zip_path)
 {
-    pthread_mutex_lock(&manager->lock);
+    pthread_mutex_lock(&mutex);
 
-    // 从 ZIP 文件中读取存储的 MD5 校验码
-    char *stored_md5 = read_file_from_zip(zip_filename, "md5.txt");
-    if (stored_md5 == NULL)
+    manager->plugins = (Plugin *)realloc(manager->plugins, (manager->plugin_count + 1) * sizeof(Plugin));
+    if (manager->plugins == NULL)
     {
-        fprintf(stderr, "Failed to read MD5 checksum from ZIP\n");
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
+        pthread_mutex_unlock(&mutex);
+        return -1;
     }
 
-    // 从 ZIP 文件中提取 Lua 脚本到临时文件
-    const char *lua_script_filename = "app-demo.lua";
-    extract_file_from_zip(zip_filename, lua_script_filename, lua_script_filename);
+    Plugin *plugin = &manager->plugins[manager->plugin_count];
+    plugin->name = strdup("MyPlugin");
+    plugin->zip_path = strdup(zip_path);
+    plugin->L = luaL_newstate();
+    luaL_openlibs(plugin->L);
+    plugin->status = PLUGIN_LOADED;
 
-    // 计算 Lua 脚本的实际 MD5 校验码
-    char *actual_md5 = calculate_md5(lua_script_filename);
-    if (actual_md5 == NULL)
+    // 提取 env.ini 和 main.lua
+    char *env_content = NULL;
+    char *lua_content = NULL;
+    if (extract_file_from_zip(zip_path, "env.ini", &env_content) != 0 ||
+        extract_file_from_zip(zip_path, "main.lua", &lua_content) != 0)
     {
-        fprintf(stderr, "Failed to calculate MD5 checksum for Lua script\n");
-        free(stored_md5);
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
+        free(plugin->name);
+        free(plugin->zip_path);
+        lua_close(plugin->L);
+        manager->plugin_count--;
+        pthread_mutex_unlock(&mutex);
+        return -1;
     }
 
-    // 比较校验码
-    if (strcmp(stored_md5, actual_md5) != 0)
+    // 创建一个新的 Lua 表用于存储 ENV 数据
+    lua_newtable(plugin->L);
+    int env_table_index = lua_gettop(plugin->L);
+
+    // 解析 env.ini 并将键值对存储到 Lua 表中
+    EnvData env_data = {plugin->L, env_table_index};
+    ini_parse_string(env_content, my_ini_handler, &env_data);
+
+    // 加载 Lua 脚本
+    if (luaL_loadbuffer(plugin->L, lua_content, strlen(lua_content), "main.lua") != 0)
     {
-        fprintf(stderr, "MD5 checksum mismatch: Lua script may have been tampered with\n");
-        free(stored_md5);
-        free(actual_md5);
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
+        fprintf(stderr, "Error loading Lua script: %s\n", lua_tostring(plugin->L, -1));
+        free(env_content);
+        free(lua_content);
+        free(plugin->name);
+        free(plugin->zip_path);
+        lua_close(plugin->L);
+        manager->plugin_count--;
+        pthread_mutex_unlock(&mutex);
+        return -1;
     }
 
-    free(stored_md5);
-    free(actual_md5);
-
-    // 创建新的 Lua 状态
-    lua_State *L = luaL_newstate();
-    if (L == NULL)
+    // 执行 Lua 脚本
+    if (lua_pcall(plugin->L, 0, 0, 0) != 0)
     {
-        fprintf(stderr, "Failed to create Lua state\n");
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
+        fprintf(stderr, "Error executing Lua script: %s\n", lua_tostring(plugin->L, -1));
+        free(env_content);
+        free(lua_content);
+        free(plugin->name);
+        free(plugin->zip_path);
+        lua_close(plugin->L);
+        manager->plugin_count--;
+        pthread_mutex_unlock(&mutex);
+        return -1;
     }
-
-    // 打开标准库
-    luaL_openlibs(L);
-
-    // 从 ZIP 文件中读取 INI 配置文件
-    char *ini_content = read_file_from_zip(zip_filename, "env.ini");
-    if (ini_content == NULL)
-    {
-        fprintf(stderr, "Failed to read INI file from ZIP\n");
-        lua_close(L);
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
-    }
-
-    // 解析 INI 内容到 Lua 表
-    parse_ini_to_lua_table(L, ini_content);
-    free(ini_content);
-
-    // 从 ZIP 文件中读取 Lua 脚本并加载
-    if (luaL_loadfile(L, lua_script_filename) || lua_pcall(L, 0, 0, 0))
-    {
-        fprintf(stderr, "Error loading Lua script: %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
-    }
-
-    // 获取插件元数据
-    lua_getglobal(L, "name");
-    const char *name = lua_tostring(L, -1);
-    lua_getglobal(L, "version");
-    const char *version = lua_tostring(L, -1);
-    lua_getglobal(L, "author");
-    const char *author = lua_tostring(L, -1);
-    lua_getglobal(L, "description");
-    const char *description = lua_tostring(L, -1);
-
-    // 创建插件结构体
-    Plugin *plugin = (Plugin *)malloc(sizeof(Plugin));
-    if (plugin == NULL)
-    {
-        fprintf(stderr, "Failed to allocate memory for plugin\n");
-        lua_close(L);
-        pthread_mutex_unlock(&manager->lock);
-        return NULL;
-    }
-
-    plugin->name = strdup(name);
-    plugin->version = strdup(version);
-    plugin->author = strdup(author);
-    plugin->description = strdup(description);
-    plugin->L = L;
-    plugin->resource_ref = LUA_NOREF;
-    plugin->state = PLUGIN_LOADED;
-    plugin->next = manager->plugins;
-    manager->plugins = plugin;
 
     // 调用 on_load 函数并传递 ENV 表
-    lua_getglobal(L, "on_load");
-    if (lua_isfunction(L, -1))
+    lua_getglobal(plugin->L, "on_load");
+    if (lua_isfunction(plugin->L, -1))
     {
-        if (lua_pcall(L, 1, 0, 0) != 0)
+        lua_pushvalue(plugin->L, env_table_index);
+        if (lua_pcall(plugin->L, 1, 0, 0) != 0)
         {
-            fprintf(stderr, "Error calling on_load: %s\n", lua_tostring(L, -1));
+            fprintf(stderr, "Error calling on_load: %s\n", lua_tostring(plugin->L, -1));
         }
     }
 
-    pthread_mutex_unlock(&manager->lock);
-    return plugin;
+    free(env_content);
+    free(lua_content);
+
+    manager->plugin_count++;
+    pthread_mutex_unlock(&mutex);
+    return 0;
+}
+
+// 执行插件
+int plugin_execute(PluginManager *manager, int plugin_index)
+{
+    pthread_mutex_lock(&mutex);
+
+    if (plugin_index < 0 || plugin_index >= manager->plugin_count)
+    {
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+
+    Plugin *plugin = &manager->plugins[plugin_index];
+    if (plugin->status != PLUGIN_LOADED)
+    {
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+
+    plugin->status = PLUGIN_RUNNING;
+
+    // 调用 main 函数
+    lua_getglobal(plugin->L, "main");
+    if (lua_isfunction(plugin->L, -1))
+    {
+        if (lua_pcall(plugin->L, 0, 0, 0) != 0)
+        {
+            fprintf(stderr, "Error calling main: %s\n", lua_tostring(plugin->L, -1));
+            plugin->status = PLUGIN_LOADED;
+            pthread_mutex_unlock(&mutex);
+            return -1;
+        }
+    }
+
+    plugin->status = PLUGIN_LOADED;
+    pthread_mutex_unlock(&mutex);
+    return 0;
 }
 
 // 卸载插件
-int plugin_manager_unload(PluginManager *manager, const char *name)
+int plugin_unload(PluginManager *manager, int plugin_index)
 {
-    pthread_mutex_lock(&manager->lock);
+    pthread_mutex_lock(&mutex);
 
-    Plugin *prev = NULL;
-    Plugin *current = manager->plugins;
-    while (current != NULL)
+    if (plugin_index < 0 || plugin_index >= manager->plugin_count)
     {
-        if (strcmp(current->name, name) == 0)
-        {
-            // 调用 on_unload 函数
-            lua_State *L = current->L;
-            lua_getglobal(L, "on_unload");
-            if (lua_isfunction(L, -1))
-            {
-                if (lua_pcall(L, 0, 0, 0) != 0)
-                {
-                    fprintf(stderr, "Error calling on_unload: %s\n", lua_tostring(L, -1));
-                }
-            }
-
-            // 释放资源
-            if (current->resource_ref != LUA_NOREF)
-            {
-                luaL_unref(L, LUA_REGISTRYINDEX, current->resource_ref);
-            }
-
-            // 关闭 Lua 状态
-            lua_close(L);
-
-            // 释放插件结构体
-            free(current->name);
-            free(current->version);
-            free(current->author);
-            free(current->description);
-            if (prev == NULL)
-            {
-                manager->plugins = current->next;
-            }
-            else
-            {
-                prev->next = current->next;
-            }
-            free(current);
-
-            pthread_mutex_unlock(&manager->lock);
-            return 0;
-        }
-        prev = current;
-        current = current->next;
+        pthread_mutex_unlock(&mutex);
+        return -1;
     }
 
-    pthread_mutex_unlock(&manager->lock);
-    return -1;
+    Plugin *plugin = &manager->plugins[plugin_index];
+    if (plugin->status != PLUGIN_LOADED)
+    {
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+
+    // 调用 on_unload 函数
+    lua_getglobal(plugin->L, "on_unload");
+    if (lua_isfunction(plugin->L, -1))
+    {
+        if (lua_pcall(plugin->L, 0, 0, 0) != 0)
+        {
+            fprintf(stderr, "Error calling on_unload: %s\n", lua_tostring(plugin->L, -1));
+        }
+    }
+
+    free(plugin->name);
+    free(plugin->zip_path);
+    lua_close(plugin->L);
+
+    // 移除插件
+    for (int i = plugin_index; i < manager->plugin_count - 1; i++)
+    {
+        manager->plugins[i] = manager->plugins[i + 1];
+    }
+    manager->plugin_count--;
+    manager->plugins = (Plugin *)realloc(manager->plugins, manager->plugin_count * sizeof(Plugin));
+
+    pthread_mutex_unlock(&mutex);
+    return 0;
 }
 
-// 执行插件的主逻辑
-int plugin_manager_execute(PluginManager *manager, const char *name)
+// 释放插件管理器
+void plugin_manager_free(PluginManager *manager)
 {
-    pthread_mutex_lock(&manager->lock);
-
-    Plugin *current = manager->plugins;
-    while (current != NULL)
+    for (int i = 0; i < manager->plugin_count; i++)
     {
-        if (strcmp(current->name, name) == 0)
-        {
-            lua_State *L = current->L;
-            lua_getglobal(L, "main");
-            if (lua_isfunction(L, -1))
-            {
-                if (lua_pcall(L, 0, 0, 0) != 0)
-                {
-                    fprintf(stderr, "Error calling main: %s\n", lua_tostring(L, -1));
-                    pthread_mutex_unlock(&manager->lock);
-                    return -1;
-                }
-            }
-            pthread_mutex_unlock(&manager->lock);
-            return 0;
-        }
-        current = current->next;
+        free(manager->plugins[i].name);
+        free(manager->plugins[i].zip_path);
+        lua_close(manager->plugins[i].L);
     }
-
-    pthread_mutex_unlock(&manager->lock);
-    return -1;
-}
-
-// 查询插件状态
-PluginState plugin_manager_query_state(PluginManager *manager, const char *name)
-{
-    pthread_mutex_lock(&manager->lock);
-
-    Plugin *current = manager->plugins;
-    while (current != NULL)
-    {
-        if (strcmp(current->name, name) == 0)
-        {
-            PluginState state = current->state;
-            pthread_mutex_unlock(&manager->lock);
-            return state;
-        }
-        current = current->next;
-    }
-
-    pthread_mutex_unlock(&manager->lock);
-    return PLUGIN_UNLOADED;
+    free(manager->plugins);
+    free(manager);
 }
